@@ -1,0 +1,69 @@
+#!/usr/bin/env ruby
+require 'optparse'
+require 'parser'
+require 'parser/current'
+require 'set'
+
+class Rewriter < Parser::Rewriter
+  def initialize(methods, expr)
+    @methods = methods
+    @expr = expr
+    super()
+  end
+
+  def on_send(node)
+    target = node.children[1].to_s
+    if node.children[0].nil? && @methods.include?(target)
+      insert_before(node.location.expression, "#{@expr}.")
+    end
+    super
+  end
+end
+
+def parse_args(options)
+  optparse = OptionParser.new do |opts|
+    opts.banner = <<-EOM
+Usage: #{File.basename($0)} [options] path/to/file.rb
+
+Options:
+EOM
+
+    opts.on('-m', '--methods LIST', 'File containing a list of methods to rewrite') do |f|
+      options[:methods] = Set.new(File.read(f).split("\n"))
+    end
+
+    opts.on('-i', '--ivar IVAR', 'Rewrite methods to be calls on the named ivar') do |ivar|
+      options[:ivar] = ivar
+    end
+  end
+
+  optparse.parse!
+
+  unless ARGV.length
+    STDERR.puts optparse
+    exit 1
+  end
+
+  ARGV
+end
+
+def main
+  options = {}
+  paths = parse_args(options)
+
+  paths.each do |path|
+    parser = parser = Parser::CurrentRuby.new
+    buf = Parser::Source::Buffer.new(path).read
+    ast = parser.parse(buf)
+
+    p = Rewriter.new(options[:methods], options[:ivar])
+    File.open(path, 'w') do |w|
+      w.write(p.rewrite(buf, ast))
+    end
+  end
+end
+
+
+if $0 == __FILE__
+  main
+end
