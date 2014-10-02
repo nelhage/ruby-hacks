@@ -8,12 +8,13 @@ class Processor < Parser::AST::Processor
   attr_reader :methods, :calls
   def initialize
     @methods = Set.new
-    @calls   = Hash.new { |h,k| h[k] = [] }
+    @calls   = {}
   end
 
   def on_def(node)
     @method = node.children[0].to_s
     @methods.add(@method)
+    @calls[@method] = []
     super
     @method = nil
   end
