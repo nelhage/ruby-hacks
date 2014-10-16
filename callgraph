@@ -40,6 +40,8 @@ class Processor < Parser::AST::Processor
     end
   end
 
+  alias on_module on_class
+
   def klass_name(node)
     bits = []
     while node
@@ -80,21 +82,26 @@ class DotRenderer
     testing? __method__ request
     configatron soft_assert])
 
-  def initialize(processor, out)
+  def initialize(processor, out, typemap=nil)
     @processor = processor
     @out = out
+    @typemap = typemap || {}
   end
 
   def render_klass(klass, calls)
     calls.each do |src, dsts|
-      @out.puts("    #{quote(src)} [style=filled];")
-      dsts.each do |obj, meth|
+      me = "#{klass}##{src}"
+      @out.puts("    #{quote(me)} [style=filled label=#{quote(src)}];")
+      dsts.uniq.each do |obj, meth|
         next if BLACKLIST.include?(meth)
-        dst = meth
         if obj
-          dst = "#{obj}.#{meth}"
+          $log.debug("looking up #{obj} in #{@typemap.inspect}..")
+          next unless dstklass = @typemap[obj]
+          dst = "#{dstklass}##{meth}"
+        else
+          dst = "#{klass}##{meth}"
         end
-        @out.puts("    #{quote(src)} -> #{quote(dst)};")
+        @out.puts("    #{quote(me)} -> #{quote(dst)};")
       end
     end
   end
@@ -104,9 +111,12 @@ class DotRenderer
     @out.puts(' page="8.5,11;"')
 
     @processor.calls.each do |klass, calls|
-      @out.puts("  subgraph #{quote(klass)} {") if klass
+      if klass
+        @out.puts("  subgraph #{quote("cluster_" + klass)} {")
+        @out.puts("    label = #{quote(klass)};")
+        @out.puts("    color = lightgrey;")
+      end
       render_klass(klass, calls)
-      @out.puts("    label = #{quote(klass)};") if klass
       @out.puts("  }") if klass
     end
 
@@ -121,7 +131,7 @@ end
 def parse_args(options)
   optparse = OptionParser.new do |opts|
     opts.banner = <<-EOM
-Usage: #{File.basename($0)} [options] path/to/file.rb
+Usage: #{File.basename($0)} [options] file.rb...
 
 Options:
 EOM
@@ -138,6 +148,12 @@ EOM
       options[:remote] = true
     end
 
+    opts.on('-t', '--type IVAR=KLASS') do |spec|
+      ivar, klass = spec.split('=')
+      options[:typemap] ||= {}
+      options[:typemap][ivar] = klass
+    end
+
     opts.on('--dot=PATH', 'Write a dot callgraph') do |path|
       options[:dot] = path
     end
@@ -149,12 +165,12 @@ EOM
 
   optparse.parse!
 
-  unless ARGV.length == 1
+  if ARGV.empty?
     STDERR.puts optparse
     exit 1
   end
 
-  return ARGV.first
+  return ARGV
 end
 
 def methods_defined(p)
@@ -183,14 +199,16 @@ end
 
 def main
   options = {}
-  path = parse_args(options)
-
-  parser = parser = Parser::CurrentRuby.new
-  buf = Parser::Source::Buffer.new(path).read
-  ast = parser.parse(buf)
-
+  paths = parse_args(options)
   p = Processor.new
-  p.process(ast)
+
+  paths.each do |path|
+    parser = Parser::CurrentRuby.new
+    buf = Parser::Source::Buffer.new(path).read
+    ast = parser.parse(buf)
+
+    p.process(ast)
+  end
 
   if options[:defined]
     methods_defined(p).each do |m|
@@ -208,7 +226,7 @@ def main
 
   if options[:dot]
     f = File.new(options[:dot], 'w')
-    DotRenderer.new(p, f).render
+    DotRenderer.new(p, f, options[:typemap]).render
     f.close
   end
 end
