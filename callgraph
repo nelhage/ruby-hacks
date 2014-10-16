@@ -3,28 +3,74 @@ require 'optparse'
 require 'parser'
 require 'parser/current'
 require 'set'
+require 'logger'
+
+$log = Logger.new(STDOUT)
+$log.level = Logger::INFO
 
 class Processor < Parser::AST::Processor
-  attr_reader :methods, :calls
+  # klass: { method: [ (callee, method) ] }
+  attr_reader :calls
+
   def initialize
-    @methods = Set.new
-    @calls   = {}
+    @calls   = Hash.new { |h,k| h[k] = {} }
+  end
+
+  def call_map
+    @calls[@klass]
   end
 
   def on_def(node)
     @method = node.children[0].to_s
-    @methods.add(@method)
-    @calls[@method] = []
+    $log.debug("  def #{@method}")
+    call_map[@method] = []
     super
     @method = nil
   end
 
-  def on_send(node)
-    target = node.children[1].to_s
-    if @method && node.children[0].nil?
-      @calls[@method] << target
+  def on_class(node)
+    orig_klass = @klass
+    begin
+      @klass = "#{@klass}::#{klass_name(node.children.first)}"
+      $log.debug("-> class #{@klass}")
+      super
+      $log.debug("<- class #{@klass}")
+    ensure
+      @klass = orig_klass
     end
+  end
+
+  def klass_name(node)
+    bits = []
+    while node
+      raise "wtf #{node}" unless node.type == :const
+      bits << node.children[1]
+      node = node.children[0]
+    end
+
+    return bits.reverse.join("::")
+  end
+
+  def on_send(node)
+    handle_send(node)
     super
+  end
+
+  def handle_send(node)
+    return unless @method
+
+    target = node.children[0]
+    meth = node.children[1].to_s
+
+    case
+    when target.nil?
+    when target.type == :ivar
+      target = target.children.first.to_s
+    else
+      return
+    end
+
+    call_map[@method] << [target, meth]
   end
 end
 
@@ -39,17 +85,29 @@ class DotRenderer
     @out = out
   end
 
+  def render_klass(klass, calls)
+    calls.each do |src, dsts|
+      @out.puts("    #{quote(src)} [style=filled];")
+      dsts.each do |obj, meth|
+        next if BLACKLIST.include?(meth)
+        dst = meth
+        if obj
+          dst = "#{obj}.#{meth}"
+        end
+        @out.puts("    #{quote(src)} -> #{quote(dst)};")
+      end
+    end
+  end
+
   def render
     @out.puts("digraph G {")
     @out.puts(' page="8.5,11;"')
 
-    @processor.calls.each do |src, dsts|
-      @out.puts("  #{quote(src)} [style=filled];")
-      dsts.each do |dst|
-        unless BLACKLIST.include?(dst)
-          @out.puts("  #{quote(src)} -> #{quote(dst)};")
-        end
-      end
+    @processor.calls.each do |klass, calls|
+      @out.puts("  subgraph #{quote(klass)} {") if klass
+      render_klass(klass, calls)
+      @out.puts("    label = #{quote(klass)};") if klass
+      @out.puts("  }") if klass
     end
 
     @out.puts("}")
@@ -83,6 +141,10 @@ EOM
     opts.on('--dot=PATH', 'Write a dot callgraph') do |path|
       options[:dot] = path
     end
+
+    opts.on('-v', 'Verbose') do
+      $log.level = Logger::DEBUG
+    end
   end
 
   optparse.parse!
@@ -93,6 +155,29 @@ EOM
   end
 
   return ARGV.first
+end
+
+def methods_defined(p)
+  out = []
+  p.calls.each do |klass, calls|
+    calls.each do |src, dsts|
+      out << "#{klass}##{src}"
+    end
+  end
+  out
+end
+
+def methods_called(p)
+  out = []
+  p.calls.each do |klass, calls|
+    calls.each do |src, dsts|
+      dsts.each do |target, method|
+        next if target
+        out << "#{klass}##{method}"
+      end
+    end
+  end
+  out.uniq
 end
 
 
@@ -108,17 +193,15 @@ def main
   p.process(ast)
 
   if options[:defined]
-    p.calls.keys.each do |m|
+    methods_defined(p).each do |m|
       puts m
     end
   elsif options[:called]
-    p.calls.values.flatten.uniq.each do |m|
+    methods_called(p).each do |m|
       puts m
     end
   elsif options[:remote]
-    called = p.calls.values.flatten.uniq
-    defined = p.calls.keys
-    (called - defined).each do |m|
+    (methods_called(p) - methods_defined(p)).each do |m|
       puts m
     end
   end
