@@ -8,30 +8,74 @@ require 'logger'
 $log = Logger.new(STDOUT)
 $log.level = Logger::INFO
 
-class Processor < Parser::AST::Processor
-  # klass: { method: [ (callee, method) ] }
-  attr_reader :calls
+module CG
+  class Method
+    attr_reader :klass, :name
+    attr_reader :callers
+    attr_reader :callees
 
-  def initialize
-    @calls   = Hash.new { |h,k| h[k] = {} }
+    def initialize(klass, name)
+      @klass = klass
+      @name = name
+      @callers = Set.new
+      @callees = Set.new
+    end
+
+    def call!(other)
+      callees.add(other)
+      other.callers.add(self)
+    end
+
+    def to_s
+      "#{klass}##{name}"
+    end
   end
 
-  def call_map
-    @calls[@klass]
+  class Klass
+    attr_reader :methods
+    attr_reader :name
+
+    def initialize(name)
+      @name = name
+      @methods = {}
+    end
+
+    def get_method(name)
+      @methods[name] ||= Method.new(self, name)
+    end
+
+    def to_s
+      name
+    end
+  end
+end
+
+class Processor < Parser::AST::Processor
+  attr_reader :klasses
+  attr_reader :typemap
+
+  def initialize(typemap)
+    @klasses = Hash.new { |h,k| h[k] = CG::Klass.new(k) }
+    @typemap = typemap
   end
 
   def on_def(node)
-    @method = node.children[0].to_s
-    $log.debug("  def #{@method}")
-    call_map[@method] = []
+    method = node.children[0].to_s
+    $log.debug("  def #{method}")
+    if @klass
+      @method = @klass.get_method(method)
+    end
+
     super
+
     @method = nil
   end
 
   def on_class(node)
     orig_klass = @klass
     begin
-      @klass = "#{@klass}::#{klass_name(node.children.first)}"
+      name = "#{@klass ? @klass.name : ""}::#{klass_name(node.children.first)}"
+      @klass = klasses[name]
       $log.debug("-> class #{@klass}")
       super
       $log.debug("<- class #{@klass}")
@@ -66,13 +110,22 @@ class Processor < Parser::AST::Processor
 
     case
     when target.nil?
+      dst = @klass.get_method(meth)
     when target.type == :ivar
-      target = target.children.first.to_s
+      ivar = target.children.first.to_s
+      dstklass = typemap[ivar]
+      if dstklass
+        dst = klasses[dstklass].get_method(meth)
+      else
+        dst = CG::Method.new(ivar, meth)
+      end
     else
       return
     end
 
-    call_map[@method] << [target, meth]
+    $log.debug(" #{@method} -> #{dst}")
+
+    @method.call!(dst)
   end
 end
 
@@ -82,26 +135,38 @@ class DotRenderer
     testing? __method__ request
     configatron soft_assert])
 
-  def initialize(processor, out, typemap=nil)
+  def initialize(processor, out)
     @processor = processor
     @out = out
-    @typemap = typemap || {}
+
+    @want = Hash.new do |h, meth|
+      h[meth] = (meth.callers + meth.callees).any? { |m| want?(meth, m) }
+    end
   end
 
-  def render_klass(klass, calls)
-    calls.each do |src, dsts|
-      me = "#{klass}##{src}"
-      @out.puts("    #{quote(me)} [style=filled label=#{quote(src)}];")
-      dsts.uniq.each do |obj, meth|
-        next if BLACKLIST.include?(meth)
-        if obj
-          $log.debug("looking up #{obj} in #{@typemap.inspect}..")
-          next unless dstklass = @typemap[obj]
-          dst = "#{dstklass}##{meth}"
-        else
-          dst = "#{klass}##{meth}"
-        end
-        @out.puts("    #{quote(me)} -> #{quote(dst)};")
+  def want?(src, dst)
+    dst.klass != src.klass && dst.klass.is_a?(CG::Klass)
+  end
+
+  def want_method?(meth)
+    @want[meth]
+  end
+
+  def render_methods(klass)
+    klass.methods.each_value do |meth|
+      next unless want_method?(meth)
+
+      @out.puts("    #{quote(meth.to_s)} [style=filled label=#{quote(meth.name)}];")
+    end
+  end
+
+  def render_calls(klass)
+    klass.methods.each_value do |meth|
+      next unless want_method?(meth)
+
+      meth.callees.each do |m|
+        next unless want?(meth, m)
+        @out.puts("    #{quote(meth)} -> #{quote(m)};")
       end
     end
   end
@@ -110,14 +175,14 @@ class DotRenderer
     @out.puts("digraph G {")
     @out.puts(' page="8.5,11;"')
 
-    @processor.calls.each do |klass, calls|
-      if klass
-        @out.puts("  subgraph #{quote("cluster_" + klass)} {")
-        @out.puts("    label = #{quote(klass)};")
-        @out.puts("    color = lightgrey;")
-      end
-      render_klass(klass, calls)
-      @out.puts("  }") if klass
+    @processor.klasses.each_value do |klass|
+      next unless klass.methods.values.any? { |m| want_method?(m) }
+      @out.puts("  subgraph #{quote("cluster_" + klass.to_s)} {")
+      @out.puts("    label = #{quote(klass)};")
+      @out.puts("    color = lightgrey;")
+      render_methods(klass)
+      @out.puts("  }")
+      render_calls(klass)
     end
 
     @out.puts("}")
@@ -200,7 +265,7 @@ end
 def main
   options = {}
   paths = parse_args(options)
-  p = Processor.new
+  p = Processor.new(options[:typemap] || {})
 
   paths.each do |path|
     parser = Parser::CurrentRuby.new
@@ -226,7 +291,7 @@ def main
 
   if options[:dot]
     f = File.new(options[:dot], 'w')
-    DotRenderer.new(p, f, options[:typemap]).render
+    DotRenderer.new(p, f).render
     f.close
   end
 end
