@@ -135,9 +135,10 @@ class DotRenderer
     testing? __method__ request
     configatron soft_assert])
 
-  def initialize(processor, out)
+  def initialize(processor, out, opts={})
     @processor = processor
     @out = out
+    @opts = opts
 
     @want = Hash.new do |h, meth|
       h[meth] = (meth.callers + meth.callees).any? { |m| want?(meth, m) }
@@ -145,7 +146,20 @@ class DotRenderer
   end
 
   def want?(src, dst)
-    dst.klass != src.klass && dst.klass.is_a?(CG::Klass)
+    return false if BLACKLIST.include?(dst.name) || BLACKLIST.include?(src.name)
+
+    case @opts[:only]
+    when nil
+      true
+    when 'self'
+      dst.klass == src.klass
+    when 'foreign'
+      dst.klass.is_a?(CG::Klass) && src.klass != dst.klass
+    when /\A@\w+/
+      dst.klass == @opts[:only]
+    else
+      raise "Unable to interpret: --only=#{@opts[:only]}"
+    end
   end
 
   def want_method?(meth)
@@ -166,7 +180,7 @@ class DotRenderer
 
       meth.callees.each do |m|
         next unless want?(meth, m)
-        @out.puts("    #{quote(meth)} -> #{quote(m)};")
+        @out.puts("  #{quote(meth)} -> #{quote(m)};")
       end
     end
   end
@@ -221,6 +235,10 @@ EOM
 
     opts.on('--dot=PATH', 'Write a dot callgraph') do |path|
       options[:dot] = path
+    end
+
+    opts.on('--only=WHAT') do |what|
+      options[:only] = what
     end
 
     opts.on('-v', 'Verbose') do
@@ -291,7 +309,7 @@ def main
 
   if options[:dot]
     f = File.new(options[:dot], 'w')
-    DotRenderer.new(p, f).render
+    DotRenderer.new(p, f, options).render
     f.close
   end
 end
